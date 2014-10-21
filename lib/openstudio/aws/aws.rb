@@ -5,6 +5,8 @@ module OpenStudio
       :proxy, :credentials, :ami_lookup_version, :openstudio_version,
       :openstudio_server_version, :region, :ssl_verify_peer, :host, :url
     ]
+	
+	#test
 
     class Aws
       # Deprecate OS_AWS object
@@ -27,10 +29,11 @@ module OpenStudio
           region: 'us-east-1',
           ssl_verify_peer: false,
           host: 'developer.nrel.gov',
-          url: '/downloads/buildings/openstudio/api'
+          url: '/downloads/buildings/openstudio/rsrc',
         }
+		#puts defaults[:url]
         options = defaults.merge(options)
-
+		#puts options[:url]
         # read in the config.yml file to get the secret/private key
         if !options[:credentials]
           config_file = OpenStudio::Aws::Config.new
@@ -47,7 +50,8 @@ module OpenStudio
           options[:credentials][:region] = options[:region]
           options[:credentials][:ssl_verify_peer] = options[:ssl_verify_peer]
         end
-
+		
+		puts "proxy\n"
         if options[:proxy]
           proxy_uri = nil
           if options[:proxy][:username]
@@ -56,16 +60,19 @@ module OpenStudio
             proxy_uri = "https://#{options[:proxy][:host]}:#{options[:proxy][:port]}"
           end
           # todo: remove this proxy_uri and make a method to format correctly
+		  
           options[:proxy_uri] = proxy_uri
+		  puts "proxyuri is #{options[:proxy_uri]}\n"
+			  
 
           # todo: do we need to escape a couple of the argument of username and password
 
           # todo: set some environment variables for system based proxy
         end
 
-        # puts "Final options are: #{options.inspect}"
+        # puts "Final options are: #{options.inspect}"		
 
-        @os_aws = OpenStudioAwsWrapper.new(options)
+        @os_aws = OpenStudioAwsWrapper.new(options)		
 
         @instances_json = nil
 
@@ -74,10 +81,14 @@ module OpenStudio
         ami_options = {}
         ami_options[:openstudio_server_version] = options[:openstudio_server_version] if options[:openstudio_server_version]
         ami_options[:openstudio_version] = options[:openstudio_version] if options[:openstudio_version]
+		
+		
         ami_options[:host] = options[:host] if options[:host]
         ami_options[:url] = options[:url] if options[:url]
-
-        @default_amis = OpenStudioAmis.new(options[:ami_lookup_version], ami_options).get_amis
+		puts "new test\n"
+		puts options[:proxy][:username]
+        @default_amis = OpenStudioAmis.new(options[:ami_lookup_version], ami_options, options[:proxy]).get_amis
+		puts "done with ami\n"
       end
 
       # def load_data_from_json(json_filename)
@@ -98,7 +109,6 @@ module OpenStudio
           ebs_volume_id: nil,
           aws_key_pair_name: nil,
           private_key_file_name: nil, # required if using an existing "aws_key_pair_name"
-          tags: []
         }
         options = defaults.merge(options)
 
@@ -106,7 +116,7 @@ module OpenStudio
           fail 'Must pass in the private_key_file_name' unless options[:private_key_file_name]
           fail "Private key was not found: #{options[:private_key_file_name]}" unless File.exist? options[:private_key_file_name]
         end
-
+		puts "getting security group...\n"
         @os_aws.create_or_retrieve_security_group options[:security_group]
         @os_aws.create_or_retrieve_key_pair options[:aws_key_pair_name]
 
@@ -119,7 +129,7 @@ module OpenStudio
           @os_aws.save_private_key('ec2_server_key.pem')
         end
 
-        server_options = { user_id: options[:user_id], tags: options[:tags] }
+        server_options = { user_id: options[:user_id] }
         # if instance_data[:ebs_volume_id]
         #   server_options[:ebs_volume_id] = instance_data[:ebs_volume_id]
         # end
@@ -136,61 +146,59 @@ module OpenStudio
         puts "ssh -i #{@os_aws.private_key_file_name} ubuntu@#{@os_aws.server.data[:dns]}"
       end
 
-      def create_workers(number_of_instances, options = {}, user_id = 'unknown_user')
+      def create_workers(number_of_instances, options = {}, _user_id = 'unknown_user')
         defaults = {
           instance_type: 'm2.4xlarge',
-          security_group: 'openstudio-server-sg-v1',
-          image_id: nil, # don't prescribe the image id so that it can determine later
-          user_id: user_id,
+          security_group: 'openstudio-worker-sg-v1',
+          image_id: @default_amis[:server],
+          user_id: 'unknown_user',
 
           # optional -- will default later
           ebs_volume_id: nil,
           aws_key_pair_name: nil,
-          private_key_file_name: nil, # required if using an existing "aws_key_pair_name",
-          tags: []
+          private_key_file_name: nil, # required if using an existing "aws_key_pair_name"
         }
         options = defaults.merge(options)
 
         # Get the right worker AMI ids based on the type of instance
         if options[:image_id].nil?
-          options[:image_id] = determine_image_type(options[:instance_type])
+          if options[:instance_type] =~ /cc2|c3/
+            options[:image_id] = @default_amis[:cc2worker]
+          else
+            options[:image_id] = @default_amis[:worker]
+          end
         end
 
         fail "Can't create workers without a server instance running" if @os_aws.server.nil?
 
-        if number_of_instances == 0
-          puts ''
-          puts 'No workers requested'
-        else
-          worker_options = { user_id: options[:user_id], tags: options[:tags] }
-          # if options[:ebs_volume_size]
-          #   worker_options[:ebs_volume_size] = options[:ebs_volume_size]
-          # end
+        worker_options = { user_id: options[:user_id] }
+        # if options[:ebs_volume_size]
+        #   worker_options[:ebs_volume_size] = options[:ebs_volume_size]
+        # end
 
-          @os_aws.launch_workers(options[:image_id], options[:instance_type], number_of_instances, worker_options)
+        @os_aws.launch_workers(options[:image_id], options[:instance_type], number_of_instances, worker_options)
 
-          ## append the information to the server_data hash that already exists
-          # @server_data[:instance_type] = instance_data[:instance_type]
-          # @server_data[:num] = number_of_instances
-          # server_string = @server_data.to_json.gsub("\"", "\\\\\"")
-          #
-          # start_string = "ruby #{os_aws_file_location} #{@config.access_key} #{@config.secret_key} us-east-1 EC2 launch_workers \"#{server_string}\""
-          # puts "Worker Command: #{start_string}"
-          # worker_data_string = `#{start_string}`
-          # @worker_data = JSON.parse(worker_data_string, :symbolize_names => true)
-          # File.open("worker_data.json", "w") { |f| f << JSON.pretty_generate(worker_data) }
-          #
-          ## Print out some debugging commands (probably work on mac/linux only)
-          # Add the worker data to the JSON
-          h = JSON.parse(File.read(@instances_json))
-          h[:workers] = @os_aws.to_os_worker_hash[:workers]
-          File.open(@instances_json, 'w') { |f| f << JSON.pretty_generate(h) }
+        ## append the information to the server_data hash that already exists
+        # @server_data[:instance_type] = instance_data[:instance_type]
+        # @server_data[:num] = number_of_instances
+        # server_string = @server_data.to_json.gsub("\"", "\\\\\"")
+        #
+        # start_string = "ruby #{os_aws_file_location} #{@config.access_key} #{@config.secret_key} us-east-1 EC2 launch_workers \"#{server_string}\""
+        # puts "Worker Command: #{start_string}"
+        # worker_data_string = `#{start_string}`
+        # @worker_data = JSON.parse(worker_data_string, :symbolize_names => true)
+        # File.open("worker_data.json", "w") { |f| f << JSON.pretty_generate(worker_data) }
+        #
+        ## Print out some debugging commands (probably work on mac/linux only)
+        # Add the worker data to the JSON
+        h = JSON.parse(File.read(@instances_json))
+        h[:workers] = @os_aws.to_os_worker_hash[:workers]
+        File.open(@instances_json, 'w') { |f| f << JSON.pretty_generate(h) }
 
-          puts ''
-          puts 'Worker SSH Command:'
-          @os_aws.workers.each do |worker|
-            puts "ssh -i #{@os_aws.private_key_file_name} ubuntu@#{worker.data[:dns]}"
-          end
+        puts ''
+        puts 'Worker SSH Command:'
+        @os_aws.workers.each do |worker|
+          puts "ssh -i #{@os_aws.private_key_file_name} ubuntu@#{worker.data[:dns]}"
         end
 
         puts ''
@@ -209,7 +217,7 @@ module OpenStudio
         resp
       end
 
-      # @params(ids): array of instance ids
+      # @params(ids): array of instances
       def terminate_instances(ids)
         puts "Terminating the following instances #{ids}"
         resp = []
@@ -270,17 +278,6 @@ module OpenStudio
           when :worker
             fail 'Worker file download is not available'
         end
-      end
-
-      def determine_image_type(instance_type)
-        image = nil
-        if instance_type =~ /cc2/
-          image = @default_amis[:cc2worker]
-        else
-          image = @default_amis[:worker]
-        end
-
-        image
       end
 
       private

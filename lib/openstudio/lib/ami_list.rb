@@ -25,11 +25,12 @@ class OpenStudioAmis
     :openstudio_version, :openstudio_server_version, :host, :url
   ]
 
-  def initialize(version = 1, options = {})
+  def initialize(version = 1, options = {},proxy)
     invalid_options = options.keys - VALID_OPTIONS
     if invalid_options.any?
       fail ArgumentError, "invalid option(s): #{invalid_options.join(', ')}"
     end
+	
 
     # merge in some defaults
     defaults = {
@@ -39,7 +40,9 @@ class OpenStudioAmis
       url: '/downloads/buildings/openstudio/api'
     }
     @version = version
-    @options = defaults.merge(options)
+    @options = defaults.merge(options)	
+	@proxy=proxy
+	puts proxy[:username]
   end
 
   def list
@@ -79,7 +82,7 @@ class OpenStudioAmis
 
   def list_amis_version_2
     endpoint = "#{@options[:url]}/amis_v2.json"
-
+    puts endpoint 
     json = retrieve_json(endpoint)
     json
   end
@@ -116,8 +119,13 @@ class OpenStudioAmis
   private
 
   def retrieve_json(endpoint)
-    result = nil
-    resp = Net::HTTP.get_response(@options[:host], endpoint)
+    result = nil	
+	puts @options[:host]
+	puts endpoint 
+	rhp=Net::HTTP::new(@options[:host],port=80, p_addr = @proxy[:host],	
+	p_port = @proxy[:port], p_user = @proxy[:username], p_pass = @proxy[:password]) 
+    resp =rhp.request_get(endpoint)
+	
     if resp.code == '200'
       result = JSON.parse(resp.body, symbolize_names: true)
     else

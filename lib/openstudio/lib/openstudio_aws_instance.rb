@@ -26,13 +26,13 @@ class OpenStudioAwsInstance
   attr_reader :private_key_file_name
   attr_reader :group_uuid
 
-  def initialize(aws_session, openstudio_instance_type, key_pair_name, security_group_name, group_uuid, private_key,
-                 private_key_file_name, proxy = nil)
+  def initialize(aws_session, openstudio_instance_type, key_pair_name, security_group_name, group_uuid, private_key, private_key_file_name, proxy = nil, _options = {})
     @data = nil # stored information about the instance
     @aws = aws_session
     @openstudio_instance_type = openstudio_instance_type # :server, :worker
     @key_pair_name = key_pair_name
     @security_group_name = security_group_name
+	@security_group_id =security_group_name
     @group_uuid = group_uuid.to_s
     @init_timestamp = Time.now  # This is the timestamp and is typically just tracked for the server
     @private_key = private_key
@@ -57,8 +57,9 @@ class OpenStudioAwsInstance
 
     # get the instance information
     test_result = @aws.describe_volumes(volume_ids: [resp[:volume_id]])
+    puts test_result
     begin
-      Timeout.timeout(600) do # 10 minutes
+      Timeout.timeout(600) { # 10 minutes
         while test_result.nil? || test_result.instance_state.name != 'available'
           # refresh the server instance information
 
@@ -66,7 +67,7 @@ class OpenStudioAwsInstance
           test_result = @aws.describe_volumes(volume_ids: [resp[:volume_id]])
           logger.info '... waiting for EBS volume to be available ...'
         end
-      end
+      }
     rescue TimeoutError
       raise "EBS volume was unable to be created due to timeout #{instance_id}"
     end
@@ -87,62 +88,53 @@ class OpenStudioAwsInstance
     # true?
   end
 
-  def launch_instance(image_id, instance_type, user_data, user_id, options = {})
+  def launch_instance(image_id, instance_type, user_data, user_id, ebs_volume_size = nil)
     # logger.info("user_data #{user_data.inspect}")
+	#add network interface for subnetID, by lzhou Oct 16, 2014	
+	 #instance_data = @aws.describe_instances(instance_ids: ['i-096a3fe4']).data.reservations.first.instances.first.to_hash
+	#@data = create_struct(instance_data, 'processors')
+	#puts @data 
     instance = {
       image_id: image_id,
       key_name: @key_pair_name,
-      security_groups: [@security_group_name],
+    #  security_groups: [@security_group_name],
+	  security_group_ids:[@security_group_id ] ,# use security group ID instead for non default VPC
       user_data: Base64.encode64(user_data),
       instance_type: instance_type,
-      placement: {
+      placement: {group_name:'NREL-EE',
         availability_zone: 'us-east-1c'
       },
+	  subnet_id:"subnet-f8bc50a1" ,
+	  iam_instance_profile: {
+			arn: "arn:aws:iam::834246177243:instance-profile/Computing"
+   		},
       min_count: 1,
       max_count: 1
+	  
     }
+	#puts instance 
     result = @aws.run_instances(instance)
 
     # determine how many processors are suppose to be in this image (lookup for now?)
     processors = find_processors(instance_type)
 
-    # create the tag structure
-    aws_tags = [
-      { key: 'Name', value: "OpenStudio-#{@openstudio_instance_type.capitalize}" },
-      { key: 'GroupUUID', value: @group_uuid },
-      { key: 'NumberOfProcessors', value: processors.to_s },
-      { key: 'Purpose', value: "OpenStudio#{@openstudio_instance_type.capitalize}" },
-      { key: 'UserID', value: user_id }
-    ]
-
-    # add in any manual tags
-    options[:tags].each do |tag|
-      t = tag.split('=')
-      if t.size != 2
-        logger.error "Tag '#{t}' not defined or does not have an equal sign"
-        puts "Tag '#{t}' not defined or does not have an equal sign"
-        next
-      end
-      if %w(Name GroupUUID NumberOfProcessors Purpose UserID).include? t[0]
-        logger.error "Tag name '#{t[0]}' is a reserved tag"
-        puts "Tag name '#{t[0]}' is a reserved tag"
-        next
-      end
-
-      aws_tags << { key: t[0].strip, value: t[1].strip }
-    end
-
     # only asked for 1 instance, so therefore it should be the first
     aws_instance = result.data.instances.first
     @aws.create_tags(
         resources: [aws_instance.instance_id],
-        tags: aws_tags
+        tags: [
+          { key: 'Name', value: "OpenStudio-#{@openstudio_instance_type.capitalize}" }, # todo: abstract out the server and version
+          { key: 'GroupUUID', value: @group_uuid },
+          { key: 'NumberOfProcessors', value: processors.to_s },
+          { key: 'Purpose', value: "OpenStudio#{@openstudio_instance_type.capitalize}" },
+          { key: 'UserID', value: user_id }
+        ]
     )
 
     # get the instance information
     test_result = @aws.describe_instance_status(instance_ids: [aws_instance.instance_id]).data.instance_statuses.first
     begin
-      Timeout.timeout(600) do # 10 minutes
+      Timeout.timeout(600) { # 10 minutes
         while test_result.nil? || test_result.instance_state.name != 'running'
           # refresh the server instance information
 
@@ -150,18 +142,21 @@ class OpenStudioAwsInstance
           test_result = @aws.describe_instance_status(instance_ids: [aws_instance.instance_id]).data.instance_statuses.first
           logger.info '... waiting for instance to be running ...'
         end
-      end
+      }
     rescue TimeoutError
       raise "Instance was unable to launch due to timeout #{aws_instance.instance_id}"
     end
 
-    if options[:ebs_volume_size]
-      create_and_attach_volume(options[:ebs_volume_size], aws_instance.instance_id, aws_instance.placement.availability_zone)
+    if ebs_volume_size
+      create_and_attach_volume(ebs_volume_size, aws_instance.instance_id, aws_instance.placement.availability_zone)
     end
 
     # now grab information about the instance
     # todo: check lengths on all of arrays
-    instance_data = @aws.describe_instances(instance_ids: [aws_instance.instance_id]).data.reservations.first.instances.first.to_hash
+#need to revise for the latest change in AWS SDK --zhoul 
+#puts @aws.describe_instances(instance_ids: ['i-215207cc']).data.reservations.first.instances.first.to_hash
+ instance_data = @aws.describe_instances(instance_ids: [aws_instance.instance_id]).data.reservations.first.instances.first.to_hash
+	
     logger.info "instance description is: #{instance_data}"
 
     @data = create_struct(instance_data, processors)
@@ -219,15 +214,9 @@ class OpenStudioAwsInstance
       'r3.4xlarge' => 16,
       'r3.8xlarge' => 32,
       't1.micro' => 1,
-      't2.micro' => 1,
       'm1.small' => 1,
       'm2.2xlarge' => 4,
       'm2.4xlarge' => 8,
-      'i2.xlarge' => 4,
-      'i2.2xlarge' => 8,
-      'i2.4xlarge' => 16,
-      'i2.8xlarge' => 32,
-      'hs1.8xlarge' => 16
     }
 
     processors = 1
@@ -250,13 +239,13 @@ class OpenStudioAwsInstance
 
   def get_proxy
     proxy = nil
-    if @proxy
-      if @proxy[:username]
-        proxy = Net::SSH::Proxy::HTTP.new(@proxy[:host], @proxy[:port], user: @proxy[:username], password: proxy[:password])
-      else
-        proxy = Net::SSH::Proxy::HTTP.new(@proxy[:host], @proxy[:port])
-      end
-    end
+    # if @proxy
+      # if @proxy[:username]
+        # proxy = Net::SSH::Proxy::HTTP.new(@proxy[:host], @proxy[:port], user: @proxy[:username], password: proxy[:password])
+      # else
+        # proxy = Net::SSH::Proxy::HTTP.new(@proxy[:host], @proxy[:port])
+      # end
+    # end
 
     proxy
   end
@@ -320,7 +309,8 @@ class OpenStudioAwsInstance
     flag = 0
     while flag == 0
       logger.info("wait_command #{command}")
-      Net::SSH.start(@data.ip, @user, proxy: get_proxy, key_data: [@private_key]) do |ssh|
+      #Net::SSH.start(@data.ip, @user, proxy: get_proxy, key_data: [@private_key]) do |ssh|
+	  Net::SSH.start(@data.ip, @user, proxy: nil, key_data: [@private_key]) do |ssh|
         channel = ssh.open_channel do |ch|
           ch.exec "#{command}" do |ch, success|
             fail "could not execute #{command}" unless success
@@ -386,10 +376,12 @@ class OpenStudioAwsInstance
   # just easier accessors to the data in the raw request except for procs which is a custom request.
   def create_struct(instance, procs)
     instance_struct = Struct.new(:instance, :id, :ip, :dns, :procs)
-    s = instance_struct.new(instance, instance[:instance_id], instance[:public_ip_address], instance[:public_dns_name], procs)
+	puts "instance is :\n"
+	puts instance
+    s = instance_struct.new(instance, instance[:instance_id], instance[:private_ip_address], instance[:private_dns_name], procs)
 
     # store some values into the member variables
-    @ip_address = instance[:public_ip_address]
+    @ip_address = instance[:public_ip]
     @instance_id = instance[:instance_id]
 
     s

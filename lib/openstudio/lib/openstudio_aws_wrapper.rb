@@ -56,6 +56,7 @@ class OpenStudioAwsWrapper
     @group_uuid = group_uuid || (SecureRandom.uuid).gsub('-', '')
 
     @security_group_name = nil
+	@security_group_id=nil
     @key_pair_name = nil
     @private_key_file_name = nil
 
@@ -69,24 +70,38 @@ class OpenStudioAwsWrapper
     @proxy = options[:proxy] ? options[:proxy] : nil
 
     # need to remove the prxoy information here
-    @aws = Aws::EC2::Client.new(options[:credentials])
+	
+	http_proxy0=Struct.new(:host,:port,:user,:password)
+	htp=http_proxy0.new(options[:proxy][:host],options[:proxy][:port],options[:proxy][:username],options[:proxy][:password])
+	#input=options[:credentials].merge({http_proxy:options[:proxy_uri]})
+	input=options[:credentials].merge({http_proxy:htp})
+	puts input
+    @aws = Aws::EC2::Client.new( input)
   end
 
   def create_or_retrieve_security_group(sg_name = nil)
     tmp_name = sg_name || 'openstudio-server-sg-v1'
+	puts "checking security groups...\n"
     group = @aws.describe_security_groups(filters: [{ name: 'group-name', values: [tmp_name] }])
-    logger.info "Length of the security group is: #{group.data.security_groups.length}"
-    if group.data.security_groups.length == 0
+	if group.security_groups.length > 0
+		puts "group name and  are #{group.security_groups[0][:group_name]},#{group.security_groups[0][:group_id]}\n"
+		@security_group_id=group.security_groups[0][:group_id]
+		logger.info "Length of the security group is: #{group.data.security_groups.length}"
+    end
+	if group.security_groups.length == 0
+	  puts "create security group\n"
       logger.info 'server group not found --- will create a new one'
-      @aws.create_security_group(group_name: tmp_name, description: "group dynamically created by #{__FILE__}")
-      @aws.authorize_security_group_ingress(
-          group_name: tmp_name,
+      sg=@aws.create_security_group(vpc_id: "vpc-f24cee97",group_name: tmp_name, description: "group dynamically created by #{__FILE__}")
+      @security_group_id=sg[:group_id]
+	  puts "created security group name and id are  #{@security_group_id}\n"
+	  @aws.authorize_security_group_ingress(
+          group_id: sg[:group_id],#tmp_name,
           ip_permissions: [
             { ip_protocol: 'tcp', from_port: 1, to_port: 65_535, ip_ranges: [cidr_ip: '0.0.0.0/0'] }
           ]
       )
       @aws.authorize_security_group_ingress(
-          group_name: tmp_name,
+          group_id: sg[:group_id],#tmp_name,
           ip_permissions: [
             { ip_protocol: 'icmp', from_port: -1, to_port: -1, ip_ranges: [cidr_ip: '0.0.0.0/0']
             }
@@ -149,11 +164,11 @@ class OpenStudioAwsWrapper
           if group_uuid && openstudio_instance_type
             # {:key=>"Purpose", :value=>"OpenStudioWorker"}
             if i_h[:tags].any? { |h| (h[:key] == 'Purpose') && (h[:value] == "OpenStudio#{openstudio_instance_type.capitalize}") } &&
-                i_h[:tags].any? { |h| (h[:key] == 'GroupUUID') && (h[:value] == group_uuid.to_s) }
+                      i_h[:tags].any? { |h|(h[:key] == 'GroupUUID') && (h[:value] == group_uuid.to_s) }
               instance_data << i_h
             end
           elsif group_uuid
-            if i_h[:tags].any? { |h| (h[:key] == 'GroupUUID') && (h[:value] == group_uuid.to_s) }
+            if i_h[:tags].any? { |h|(h[:key] == 'GroupUUID') && (h[:value] == group_uuid.to_s) }
               instance_data << i_h
             end
           elsif openstudio_instance_type
@@ -218,13 +233,13 @@ class OpenStudioAwsWrapper
   def terminate_instances(ids)
     begin
       resp = @aws.terminate_instances(
-          instance_ids: ids
+          instance_ids: ids,
       )
     rescue Aws::EC2::Errors::InvalidInstanceIDNotFound
       # Log that the instances couldn't be found?
-      return resp = { error: 'instances could not be found' }
+      return resp = {error: 'instances could not be found'}
     end
-
+      
     resp
   end
 
@@ -275,24 +290,27 @@ class OpenStudioAwsWrapper
     end
   end
 
-  def launch_server(image_id, instance_type, launch_options = {})
-    defaults = { user_id: 'unknown_user', tags: [], ebs_volume_size: nil }
-    launch_options = defaults.merge(launch_options)
+  def launch_server(image_id, instance_type, options = {})
+  puts "iamgeID #{image_id }\n"
+  
+    defaults = { user_id: 'unknown_user' }
+    options = defaults.merge(options)
 
     user_data = File.read(File.expand_path(File.dirname(__FILE__)) + '/server_script.sh')
-    @server = OpenStudioAwsInstance.new(@aws, :server, @key_pair_name, @security_group_name, @group_uuid, @private_key,
-                                        @private_key_file_name, @proxy)
+	#puts "aws instance:\n"
+	#puts @aws
+    @server = OpenStudioAwsInstance.new(@aws, :server, @key_pair_name, @security_group_id, @group_uuid, @private_key, @private_key_file_name, @proxy)
 
     # create the EBS volumes instead of the ephemeral storage - needed especially for the m3 instances (SSD)
 
     fail 'image_id is nil' unless image_id
     fail 'instance type is nil' unless instance_type
-    @server.launch_instance(image_id, instance_type, user_data, launch_options[:user_id], launch_options)
+    @server.launch_instance(image_id, instance_type, user_data, options[:user_id], options[:ebs_volume_size])
   end
 
-  def launch_workers(image_id, instance_type, num, launch_options = {})
-    defaults = { user_id: 'unknown_user', tags: [], ebs_volume_size: nil }
-    launch_options = defaults.merge(launch_options)
+  def launch_workers(image_id, instance_type, num, options = {})
+    defaults = { user_id: 'unknown_user' }
+    options = defaults.merge(options)
 
     user_data = File.read(File.expand_path(File.dirname(__FILE__)) + '/worker_script.sh.template')
     user_data.gsub!(/SERVER_IP/, @server.data.ip)
@@ -303,18 +321,17 @@ class OpenStudioAwsWrapper
     # thread the launching of the workers
 
     num.times do
-      @workers << OpenStudioAwsInstance.new(@aws, :worker, @key_pair_name, @security_group_name, @group_uuid,
-                                            @private_key, @private_key_file_name, @proxy)
+      @workers << OpenStudioAwsInstance.new(@aws, :worker, @key_pair_name, @security_group_id, @group_uuid, @private_key, @private_key_file_name, @proxy)
     end
 
     threads = []
     @workers.each do |worker|
       threads << Thread.new do
         # create the EBS volumes instead of the ephemeral storage - needed especially for the m3 instances (SSD)
-        worker.launch_instance(image_id, instance_type, user_data, launch_options[:user_id], launch_options)
+        worker.launch_instance(image_id, instance_type, user_data, options[:user_id], options[:ebs_volume_size])
       end
     end
-    threads.each(&:join)
+    threads.each { |t| t.join }
 
     # todo: do we need to have a flag if the worker node is successful?
     # todo: do we need to check the current list of running workers?
@@ -352,8 +369,7 @@ class OpenStudioAwsWrapper
     @server.shell_command('chmod 664 /mnt/openstudio/rails-models/mongoid.yml')
     @workers.each { |worker| worker.shell_command('chmod 664 /mnt/openstudio/rails-models/mongoid.yml') }
 
-    # I'm removing this as of 10/6/14. This should have been resolved by now.
-    # sleep 60 # wait 60 more seconds for everything -- this is cheesy
+    sleep 60 # wait 60 more seconds for everything -- this is cheesy
     true
   end
 
@@ -502,26 +518,16 @@ class OpenStudioAwsWrapper
         a[:tested] = false
       end
 
-      # TODO: in 1.6.0 just stop putting in the cc2workers.
-      if ami[:tags_hash][:openstudio_version].to_version >= '1.5.0'
-        if ami[:name] =~ /Server/
-          a[:amis][:server] = ami[:image_id]
-        elsif ami[:name] =~ /Worker/
+      if ami[:name] =~ /Worker|Cluster/
+        if ami[:virtualization_type] == 'paravirtual'
           a[:amis][:worker] = ami[:image_id]
+        elsif ami[:virtualization_type] == 'hvm'
           a[:amis][:cc2worker] = ami[:image_id]
+        else
+          fail "unknown virtualization_type in #{ami[:name]}"
         end
-      else
-        if ami[:name] =~ /Worker|Cluster/
-          if ami[:virtualization_type] == 'paravirtual'
-            a[:amis][:worker] = ami[:image_id]
-          elsif ami[:virtualization_type] == 'hvm'
-            a[:amis][:cc2worker] = ami[:image_id]
-          else
-            fail "unknown virtualization_type in #{ami[:name]}"
-          end
-        elsif ami[:name] =~ /Server/
-          a[:amis][:server] = ami[:image_id]
-        end
+      elsif ami[:name] =~ /Server/
+        a[:amis][:server] = ami[:image_id]
       end
     end
     # puts "Current AMIs: #{JSON.pretty_generate(amis)}"
@@ -535,7 +541,7 @@ class OpenStudioAwsWrapper
       next_version = get_next_version('0.0.1', list_of_svs)
       list_of_svs << next_version
 
-      amis[:openstudio_server][next_version.to_sym] ||= {}
+      amis[:openstudio_server][next_version.to_sym] = {} unless amis[:openstudio_server][next_version.to_sym]
       a = amis[:openstudio_server][next_version.to_sym]
       a[:amis] = {} unless a[:amis]
 
@@ -554,10 +560,10 @@ class OpenStudioAwsWrapper
       a = amis[:openstudio_server][key]
       ov = a[:openstudio_version]
 
-      amis[:openstudio][ov] ||= {}
+      amis[:openstudio][ov] = {} unless amis[:openstudio][ov]
       osv = key
-      amis[:openstudio][ov][osv] ||= {}
-      amis[:openstudio][ov][osv][:amis] ||= {}
+      amis[:openstudio][ov][osv] = {} unless amis[:openstudio][ov][osv]
+      amis[:openstudio][ov][osv][:amis] = {} unless amis[:openstudio][ov][osv][:amis]
       amis[:openstudio][ov][osv][:amis][:server] = a[:amis][:server]
       amis[:openstudio][ov][osv][:amis][:worker] = a[:amis][:worker]
       amis[:openstudio][ov][osv][:amis][:cc2worker] = a[:amis][:cc2worker]
